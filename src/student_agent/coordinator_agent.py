@@ -43,7 +43,7 @@ class CoordinatorAgent:
         trace.emit(case_id=case_id, event_type="handoff", actor="coordinator", target="payment_agent")
 
         shipment, payment = await asyncio.gather(
-            self.order_shipment_agent.investigate(entity, gateway, trace),
+            self.order_shipment_agent.investigate(entity, gateway, trace, case_id=case_id),
             self.payment_agent.check_transactions(entity, gateway, trace),
         )
 
