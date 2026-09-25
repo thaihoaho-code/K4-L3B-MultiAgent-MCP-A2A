@@ -4,6 +4,7 @@ from typing import Any
 
 from .mcp_gateway import EvidenceGateway
 from .trace import TraceWriter
+from .coordinator_agent import CoordinatorAgent
 
 
 async def solve_case(
@@ -14,5 +15,5 @@ async def solve_case(
     Include entity resolution, conflict handling and evidence-efficient investigation.
     The starter kit intentionally does not generate invented fallback answers.
     """
-    del case, gateway, trace
-    raise NotImplementedError("Implement the L3B multi-agent workflow in solve_case()")
+    coordinator = CoordinatorAgent()
+    return await coordinator.execute_workflow(case, gateway, trace)
