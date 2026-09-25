@@ -1,308 +1,106 @@
-"""Tests for EntityAgent — Nguyễn Tiến Phát.
-
-Covers:
-  1. Single candidate exact match → resolved
-  2. Two candidates close scores → ambiguous
-  3. No valid candidate → not_found
-  4. Fuzzy customer match still resolves
-  5. Rejected candidate in rejected list
-  6. Evidence isolation (no cross-case)
-  7. Candidate scoring helpers
-"""
 from __future__ import annotations
+
+import asyncio
 
 import pytest
 
-from student_agent.entity_agent import (
-    EntityAgent,
-    _normalize_text,
-    _resolve_candidates,
-    _score_candidate,
-    _similarity,
-)
-from student_agent.state import EntityResult
+from conftest import ORDER_ID, FakeGateway, make_case, scenario
+from student_agent.agent_types import ENTITY_AGENT, AgentTask
+from student_agent.agents.entity_customer import rank_candidates, run_entity_customer_agent
+from student_agent.evidence_cache import CaseEvidenceStore, CrossCaseEvidenceError
 
-# ---------------------------------------------------------------------------
-# Helper: mock gateway + trace
-# ---------------------------------------------------------------------------
-
-class _FakeTrace:
-    """Capture trace.emit() calls for assertions."""
-
-    def __init__(self) -> None:
-        self.events: list[dict] = []
-
-    def emit(self, **kwargs) -> dict:
-        self.events.append(kwargs)
-        return kwargs
+OTHER_ID = "fedcba9876543210fedcba9876543210"
 
 
-class _FakeGateway:
-    """Return pre-loaded MCP responses keyed by (tool_name, order_id | customer_unique_id)."""
-
-    def __init__(self, responses: dict[tuple[str, str], dict]) -> None:
-        self._responses = responses
-
-    async def call(self, tool_name: str, *, case_id: str, **kwargs: str) -> dict:
-        key_value = kwargs.get("order_id") or kwargs.get("customer_unique_id") or ""
-        key = (tool_name, key_value)
-        if key not in self._responses:
-            raise RuntimeError(f"MCP tool {tool_name} failed: not found")
-        return self._responses[key]
-
-
-# ---------------------------------------------------------------------------
-# Test normalisation helpers
-# ---------------------------------------------------------------------------
-
-class TestNormalization:
-    def test_basic_normalize(self):
-        assert _normalize_text("  Hello   World  ") == "hello world"
-
-    def test_unicode_normalize(self):
-        assert _normalize_text("Ｆｕｌｌ　Ｗｉｄｔｈ") == "full width"
-
-    def test_similarity_exact(self):
-        assert _similarity("hello", "hello") == 1.0
-
-    def test_similarity_different(self):
-        assert _similarity("hello", "world") < 0.5
-
-    def test_similarity_empty(self):
-        assert _similarity("", "hello") == 0.0
-
-    def test_similarity_close(self):
-        assert _similarity("customer-abc123", "customer-abc124") > 0.85
+def entity_task(case: dict, case_id: str | None = None) -> AgentTask:
+    request = case["customer_request"]
+    return AgentTask(
+        case_id=case_id or case["case_id"],
+        task_id="T01",
+        from_actor="coordinator",
+        to_actor=ENTITY_AGENT,
+        task_type="resolve_entity",
+        payload={
+            "claimed_order_id": request["claimed_order_id"],
+            "candidate_order_ids": case["candidate_order_ids"],
+            "customer_unique_id_hint": case["customer_unique_id_hint"],
+            "opened_at": case["opened_at"],
+        },
+    )
 
 
-# ---------------------------------------------------------------------------
-# Test candidate scoring
-# ---------------------------------------------------------------------------
-
-class TestCandidateScoring:
-    def test_exact_match_high_score(self):
-        case = {
-            "customer_request": {
-                "claimed_order_id": "order-001",
-                "claims": [{"claim_id": "c1", "topic": "late_delivery_logistics"}],
-            },
-            "customer_unique_id_hint": "cust-abc",
-            "opened_at": "2018-06-01T00:00:00",
-        }
-        order_data = {
-            "customer_unique_id": "cust-abc",
-            "order_purchase_timestamp": "2018-05-01T00:00:00",
-            "order_status": "delivered",
-        }
-        result = _score_candidate("order-001", order_data, case)
-        assert result["valid"] is True
-        assert result["score"] >= 0.85
-        assert "exact_order_hint" in result["matched_signals"]
-        assert "order_exists" in result["matched_signals"]
-        assert "customer_match" in result["matched_signals"]
-
-    def test_no_order_data_zero_score(self):
-        case = {"customer_request": {"claimed_order_id": "x"}, "opened_at": "2018-01-01"}
-        result = _score_candidate("candidate-fake", None, case)
-        assert result["valid"] is False
-        assert result["score"] == 0.0
-
-    def test_candidate_without_hint_match(self):
-        case = {
-            "customer_request": {"claimed_order_id": "order-001", "claims": []},
-            "customer_unique_id_hint": "cust-abc",
-            "opened_at": "2018-06-01T00:00:00",
-        }
-        order_data = {
-            "customer_unique_id": "cust-xyz-different",
-            "order_purchase_timestamp": "2018-05-01T00:00:00",
-        }
-        result = _score_candidate("order-001", order_data, case)
-        assert result["valid"] is True
-        # Has exact_order_hint but no customer_match
-        assert "exact_order_hint" in result["matched_signals"]
-        assert "customer_match" not in result["matched_signals"]
+def run(store, case):
+    return asyncio.run(run_entity_customer_agent(entity_task(case), store))
 
 
-# ---------------------------------------------------------------------------
-# Test resolution policy
-# ---------------------------------------------------------------------------
-
-class TestResolutionPolicy:
-    def test_single_strong_candidate_resolves(self):
-        scored = [
-            {"candidate_id": "real-order", "score": 0.90, "matched_signals": ["a"], "valid": True},
-            {"candidate_id": "fake-001", "score": 0.0, "matched_signals": [], "valid": False},
-        ]
-        status, resolved, rejected = _resolve_candidates(scored)
-        assert status == "resolved"
-        assert resolved == "real-order"
-        assert "fake-001" in rejected
-
-    def test_two_close_candidates_ambiguous(self):
-        scored = [
-            {"candidate_id": "a", "score": 0.70, "matched_signals": ["x"], "valid": True},
-            {"candidate_id": "b", "score": 0.65, "matched_signals": ["y"], "valid": True},
-        ]
-        status, resolved, rejected = _resolve_candidates(scored)
-        assert status == "ambiguous"
-
-    def test_no_valid_candidates_not_found(self):
-        scored = [
-            {"candidate_id": "fake-1", "score": 0.0, "matched_signals": [], "valid": False},
-            {"candidate_id": "fake-2", "score": 0.0, "matched_signals": [], "valid": False},
-        ]
-        status, resolved, rejected = _resolve_candidates(scored)
-        assert status == "not_found"
-        assert resolved is None
-        assert len(rejected) == 2
-
-    def test_clear_gap_resolves(self):
-        scored = [
-            {"candidate_id": "a", "score": 0.85, "matched_signals": ["x"], "valid": True},
-            {"candidate_id": "b", "score": 0.30, "matched_signals": ["y"], "valid": True},
-        ]
-        status, resolved, rejected = _resolve_candidates(scored)
-        assert status == "resolved"
-        assert resolved == "a"
+def test_exact_candidate_resolves_and_rejects_decoy(store_factory) -> None:
+    store, gateway = store_factory(scenario())
+    result = run(store, make_case())
+    assert result.data["status"] == "resolved"
+    assert result.data["resolved_order_ids"] == [ORDER_ID]
+    assert result.data["rejected_candidates"] == ["candidate-decoy"]
+    assert result.confidence >= 0.9
+    assert result.data["customer_unique_id"] == "customer-test"
+    assert result.data["related_order_ids"] == [ORDER_ID]
+    # malformed decoy is rejected without spending an MCP call on it
+    assert [name for name, _ in gateway.calls] == ["get_customer_history", "get_order"]
 
 
-# ---------------------------------------------------------------------------
-# Test full EntityAgent async flow
-# ---------------------------------------------------------------------------
+def test_two_equally_supported_candidates_are_ambiguous(store_factory) -> None:
+    data = scenario()
+    data["get_customer_history"]["orders"].append(dict(data["get_order"], order_id=OTHER_ID))
+    store, gateway = store_factory(data, known_orders=(OTHER_ID,))
+    case = make_case(candidates=[ORDER_ID, OTHER_ID])
+    case["customer_request"]["claimed_order_id"] = None
+    result = run(store, case)
+    assert result.data["status"] == "ambiguous"
+    assert result.data["resolved_order_ids"] == []
+    assert result.confidence <= 0.6
+    assert [name for name, _ in gateway.calls].count("get_order") == 2
 
-class TestEntityAgentResolve:
-    @pytest.mark.asyncio
-    async def test_resolved_case(self):
-        """One real order + one fake candidate → resolved."""
-        case = {
-            "case_id": "L3B_CASE_TEST",
-            "opened_at": "2018-06-01T09:00:00-03:00",
-            "customer_request": {
-                "claimed_order_id": "real-order-abc",
-                "claims": [{"claim_id": "c1", "topic": "late_delivery_logistics"}],
-            },
-            "candidate_order_ids": ["real-order-abc", "candidate-fake"],
-            "customer_unique_id_hint": "customer-abc",
-            "investigation_scope": {"include_customer_history": True},
-        }
-        gateway = _FakeGateway({
-            ("get_order", "real-order-abc"): {
-                "evidence_ref": "ev_test_order_real_abc_12345678901234567890",
-                "data": {
-                    "customer_unique_id": "customer-abc",
-                    "order_purchase_timestamp": "2018-05-01T00:00:00",
-                    "order_status": "delivered",
-                },
-            },
-            # "candidate-fake" will raise RuntimeError → marked invalid
-            ("get_customer_history", "customer-abc"): {
-                "evidence_ref": "ev_test_cust_history_abc_12345678901234567890",
-                "data": {
-                    "customer_unique_id": "customer-abc",
-                    "order_ids": ["real-order-abc", "old-order-xyz"],
-                },
-            },
-        })
-        trace = _FakeTrace()
 
-        agent = EntityAgent()
-        result = await agent.resolve(case, gateway, trace)
+def test_no_plausible_candidate_is_not_found(store_factory) -> None:
+    data = scenario()
+    data["get_customer_history"]["orders"] = []
+    store, _ = store_factory(data)
+    case = make_case(candidates=["candidate-a", "candidate-b"])
+    case["customer_request"]["claimed_order_id"] = "candidate-a"
+    result = run(store, case)
+    assert result.data["status"] == "not_found"
+    assert result.data["resolved_order_ids"] == []
+    assert result.data["customer_unique_id"] is None
 
-        assert isinstance(result, EntityResult)
-        assert result.resolution_status == "resolved"
-        assert result.resolved_order_id == "real-order-abc"
-        assert "candidate-fake" in result.rejected_order_ids
-        assert result.customer_unique_id == "customer-abc"
-        assert "real-order-abc" in result.related_order_ids
-        assert result.confidence > 0.5
-        assert len(result.evidence_refs) >= 1
 
-        # Verify trace events
-        event_types = [e["event_type"] for e in trace.events]
-        assert "task_assigned" in event_types
-        assert "tool_result_consumed" in event_types
-        assert "handoff" in event_types
+def test_fuzzy_candidate_maps_to_history_order() -> None:
+    typo = ORDER_ID[:-1] + "0"
+    ranked = rank_candidates([typo, "candidate-x"], typo, [ORDER_ID])
+    assert ranked[0].canonical == ORDER_ID
+    assert "history_fuzzy" in ranked[0].signals
 
-    @pytest.mark.asyncio
-    async def test_not_found_case(self):
-        """All candidates fail MCP → not_found."""
-        case = {
-            "case_id": "L3B_CASE_NF",
-            "opened_at": "2018-06-01T09:00:00",
-            "customer_request": {
-                "claimed_order_id": "nonexistent",
-                "claims": [],
-            },
-            "candidate_order_ids": ["nonexistent", "also-fake"],
-            "customer_unique_id_hint": "",
-            "investigation_scope": {},
-        }
-        gateway = _FakeGateway({})  # All calls will fail
-        trace = _FakeTrace()
 
-        agent = EntityAgent()
-        result = await agent.resolve(case, gateway, trace)
+def test_scoped_record_is_latest_before_case_opened(store_factory) -> None:
+    store, _ = store_factory(scenario())
+    result = run(store, make_case())
+    scoped = result.data["scoped"]
+    assert scoped.row["order_purchase_timestamp"].startswith("2018-03-01")
+    assert result.data["conflict_candidates"][0]["field"] == "order_purchase_timestamp"
 
-        assert result.resolution_status == "not_found"
-        assert result.resolved_order_id is None
-        assert result.confidence == 0.0
 
-    @pytest.mark.asyncio
-    async def test_evidence_refs_are_unique(self):
-        """Evidence refs should not contain duplicates."""
-        case = {
-            "case_id": "L3B_CASE_DEDUP",
-            "opened_at": "2018-06-01T09:00:00",
-            "customer_request": {
-                "claimed_order_id": "order-a",
-                "claims": [],
-            },
-            "candidate_order_ids": ["order-a"],
-            "customer_unique_id_hint": "cust-a",
-            "investigation_scope": {"include_customer_history": True},
-        }
-        gateway = _FakeGateway({
-            ("get_order", "order-a"): {
-                "evidence_ref": "ev_test_order_aaaaaaaaaa_12345678901234567890",
-                "data": {"customer_unique_id": "cust-a", "order_purchase_timestamp": "2018-01-01"},
-            },
-            ("get_customer_history", "cust-a"): {
-                "evidence_ref": "ev_test_cust_bbbbbbbbbb_12345678901234567890",
-                "data": {"customer_unique_id": "cust-a", "order_ids": ["order-a"]},
-            },
-        })
-        trace = _FakeTrace()
+def test_evidence_from_another_case_is_rejected(trace) -> None:
+    gateway = FakeGateway(scenario())
+    first = CaseEvidenceStore("L3B_CASE_A01", gateway, trace)
+    second = CaseEvidenceStore("L3B_CASE_B01", gateway, trace)
+    evidence = asyncio.run(first.fetch(ENTITY_AGENT, "get_order", order_id=ORDER_ID))
+    with pytest.raises(CrossCaseEvidenceError):
+        second.consume(ENTITY_AGENT, evidence)
 
-        agent = EntityAgent()
-        result = await agent.resolve(case, gateway, trace)
 
-        assert len(result.evidence_refs) == len(set(result.evidence_refs))
+def test_record_not_yet_due_at_case_opening_is_not_in_scope() -> None:
+    from conftest import order_row
+    from student_agent.scoping import select_scoped_record
 
-    @pytest.mark.asyncio
-    async def test_rejected_and_resolved_do_not_overlap(self):
-        """Resolved order must not appear in rejected list."""
-        case = {
-            "case_id": "L3B_CASE_OVL",
-            "opened_at": "2018-06-01T09:00:00",
-            "customer_request": {
-                "claimed_order_id": "order-real",
-                "claims": [],
-            },
-            "candidate_order_ids": ["order-real", "order-fake"],
-            "customer_unique_id_hint": "cust-x",
-            "investigation_scope": {},
-        }
-        gateway = _FakeGateway({
-            ("get_order", "order-real"): {
-                "evidence_ref": "ev_test_order_cccccccccc_12345678901234567890",
-                "data": {"customer_unique_id": "cust-x", "order_purchase_timestamp": "2018-01-01"},
-            },
-        })
-        trace = _FakeTrace()
-
-        agent = EntityAgent()
-        result = await agent.resolve(case, gateway, trace)
-
-        if result.resolved_order_id:
-            assert result.resolved_order_id not in result.rejected_order_ids
+    due = order_row("2018-08-05", order_status="canceled", order_delivered_customer_date=None)
+    in_transit = order_row("2018-08-14")  # estimated 2018-08-24, after the case opened
+    scoped = select_scoped_record([due, in_transit], "2018-08-17T09:00:00-03:00")
+    assert scoped.row["order_status"] == "canceled"
+    assert scoped.window.end is not None
