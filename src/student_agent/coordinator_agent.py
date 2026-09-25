@@ -44,7 +44,13 @@ class CoordinatorAgent:
 
         shipment, payment = await asyncio.gather(
             self.order_shipment_agent.investigate(entity, gateway, trace),
-            self.payment_agent.check_transactions(entity, gateway, trace),
+            self.payment_agent.check_transactions(
+                entity,
+                gateway,
+                trace,
+                case_id=case_id,
+                case=case,
+            ),
         )
 
         # --- Bước 3: Policy + Conflict Resolution ---
