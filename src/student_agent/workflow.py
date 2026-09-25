@@ -248,7 +248,7 @@ async def run_case(
         shipment_task = state.next_task("investigate_order_shipment", scope)
         shipment_reply = await dispatch(
             shipment_task,
-            lambda: order_shipment_agent.investigate(state.entity, scoped_gateway, trace),
+            lambda: order_shipment_agent.investigate(state.entity, scoped_gateway, trace, case_id=state.case_id),
             ShipmentResult,
             lambda value: (
                 "insufficient_evidence" if value.verdict == "insufficient_evidence" else "ok"
