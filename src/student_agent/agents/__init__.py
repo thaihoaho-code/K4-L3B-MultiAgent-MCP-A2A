@@ -1,19 +1,20 @@
-"""Stable imports for the existing agents in the main-branch pipeline.
+"""Specialist agents. Each exposes ``async run_*(task, store) -> AgentResult``."""
 
-The implementations remain in their current modules; Stage 1 does not move
-or edit specialist-owned files.
-"""
-
-from ..entity_agent import EntityAgent
-from ..order_shipment_agent import OrderShipmentAgent
-from ..payment_agent import PaymentAgent
-from ..policy_agent import PolicyAgent
-from ..verifier_agent import VerifierAgent
+from .conflict_resolver import run_conflict_resolver
+from .entity_customer import run_entity_customer_agent
+from .order_product import run_order_product_agent, run_seller_verification
+from .payment_refund import run_payment_refund_agent
+from .policy import run_policy_agent
+from .shipment import run_shipment_agent
+from .verifier import run_verifier
 
 __all__ = [
-    "EntityAgent",
-    "OrderShipmentAgent",
-    "PaymentAgent",
-    "PolicyAgent",
-    "VerifierAgent",
+    "run_conflict_resolver",
+    "run_entity_customer_agent",
+    "run_order_product_agent",
+    "run_payment_refund_agent",
+    "run_policy_agent",
+    "run_seller_verification",
+    "run_shipment_agent",
+    "run_verifier",
 ]

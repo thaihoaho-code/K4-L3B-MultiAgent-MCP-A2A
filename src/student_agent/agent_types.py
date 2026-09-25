@@ -1,127 +1,138 @@
-"""A2A contracts for the typed specialist pipeline on ``main``."""
+"""Shared A2A contract: actor names, task routes, decision codes and result envelopes.
+
+Every agent receives an :class:`AgentTask` from the coordinator and answers with exactly one
+:class:`AgentResult`. Results carry facts, confidence, evidence refs, warnings and a decision
+code only; they never carry prompts or private reasoning.
+"""
 
 from __future__ import annotations
 
-import math
-import re
-from dataclasses import dataclass
-from typing import Any, Generic, Protocol, TypeVar
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Any
 
-from .mcp_gateway import EvidenceGateway
-from .state import (
-    ClaimAssessment,
-    EntityResult,
-    PaymentResult,
-    PolicyResult,
-    ShipmentResult,
+COORDINATOR = "coordinator"
+ENTITY_AGENT = "entity-agent"
+ORDER_AGENT = "order-product-agent"
+SHIPMENT_AGENT = "shipment-agent"
+PAYMENT_AGENT = "payment-refund-agent"
+POLICY_AGENT = "policy-agent"
+CONFLICT_RESOLVER = "conflict-resolver"
+VERIFIER = "verifier"
+
+ACTORS = (
+    COORDINATOR,
+    ENTITY_AGENT,
+    ORDER_AGENT,
+    SHIPMENT_AGENT,
+    PAYMENT_AGENT,
+    POLICY_AGENT,
+    CONFLICT_RESOLVER,
+    VERIFIER,
 )
-from .trace import TraceWriter
 
-ResultT = TypeVar("ResultT")
-CASE_ID = re.compile(r"^[A-Z0-9][A-Z0-9_-]{2,63}$")
-EVIDENCE_REF = re.compile(r"^ev_[A-Za-z0-9_-]{20,96}$")
-AGENT_STATUSES = frozenset(
-    {"ok", "ambiguous", "insufficient_evidence", "needs_followup", "error"}
+
+class Status(StrEnum):
+    OK = "ok"
+    AMBIGUOUS = "ambiguous"
+    INSUFFICIENT_EVIDENCE = "insufficient_evidence"
+    NEEDS_FOLLOWUP = "needs_followup"
+    ERROR = "error"
+
+
+@dataclass(frozen=True)
+class TaskRoute:
+    """Which actor owns a task type and the decision code used when it is assigned."""
+
+    actor: str
+    assign_code: str
+
+
+TASK_ROUTES: dict[str, TaskRoute] = {
+    "resolve_entity": TaskRoute(ENTITY_AGENT, "RESOLVE_ENTITY"),
+    "investigate_order": TaskRoute(ORDER_AGENT, "INVESTIGATE_ORDER"),
+    "verify_seller": TaskRoute(ORDER_AGENT, "VERIFY_SELLER"),
+    "investigate_shipment": TaskRoute(SHIPMENT_AGENT, "INVESTIGATE_SHIPMENT"),
+    "investigate_payment": TaskRoute(PAYMENT_AGENT, "INVESTIGATE_PAYMENT"),
+    "decide_policy": TaskRoute(POLICY_AGENT, "CHECK_POLICY"),
+    "resolve_conflicts": TaskRoute(CONFLICT_RESOLVER, "RESOLVE_CONFLICT"),
+    "verify_output": TaskRoute(VERIFIER, "VERIFY_OUTPUT"),
+}
+
+# Least privilege: an actor may only call the MCP tools listed here.
+TOOL_PERMISSIONS: dict[str, frozenset[str]] = {
+    COORDINATOR: frozenset(),
+    ENTITY_AGENT: frozenset({"get_customer_history", "get_order"}),
+    ORDER_AGENT: frozenset({"get_order_items", "get_product_context", "get_sellers"}),
+    SHIPMENT_AGENT: frozenset({"get_shipment_summary"}),
+    PAYMENT_AGENT: frozenset({"get_payment_timeline", "get_order_payments", "get_refund_timeline"}),
+    POLICY_AGENT: frozenset({"get_policy"}),
+    CONFLICT_RESOLVER: frozenset(),
+    VERIFIER: frozenset(),
+}
+
+PRIMARY_ISSUES = (
+    "canceled_order_paid",
+    "unavailable_order_paid",
+    "late_delivery_seller",
+    "late_delivery_logistics",
+    "valid_split_payment",
+    "payment_mismatch",
+    "duplicate_charge",
+    "refund_pending",
+    "refund_failed",
+    "unsupported_claim",
+    "insufficient_evidence",
 )
-
-
-def validate_evidence_refs(refs: tuple[str, ...]) -> None:
-    """Validate syntax only; MCP audit must establish actual provenance later."""
-    if len(refs) != len(set(refs)):
-        raise ValueError("evidence_refs must be unique")
-    if any(not isinstance(ref, str) or not EVIDENCE_REF.fullmatch(ref) for ref in refs):
-        raise ValueError("invalid evidence_ref syntax")
 
 
 @dataclass(frozen=True)
 class AgentTask:
+    """A2A message envelope sent by the coordinator to one specialist."""
+
     case_id: str
     task_id: str
     from_actor: str
     to_actor: str
     task_type: str
-    payload: dict[str, Any]
+    payload: dict[str, Any] = field(default_factory=dict)
     evidence_refs: tuple[str, ...] = ()
 
-    def __post_init__(self) -> None:
-        if not CASE_ID.fullmatch(self.case_id):
-            raise ValueError("invalid case_id in A2A task")
-        if not self.task_id or not self.from_actor or not self.to_actor or not self.task_type:
-            raise ValueError("A2A task identifiers are required")
-        if not isinstance(self.payload, dict):
-            raise TypeError("A2A task payload must be a dictionary")
-        validate_evidence_refs(self.evidence_refs)
 
-
-@dataclass(frozen=True)
-class AgentResult(Generic[ResultT]):
-    """Handoff metadata around an existing typed specialist result."""
+@dataclass
+class AgentResult:
+    """A2A reply envelope returned by a specialist to the coordinator."""
 
     case_id: str
     task_id: str
     actor: str
-    status: str
-    data: ResultT
-    evidence_refs: tuple[str, ...]
-    decision_code: str
-    confidence: float | None = None
-    warnings: tuple[str, ...] = ()
+    status: Status
+    confidence: float
+    data: dict[str, Any] = field(default_factory=dict)
+    evidence_refs: list[str] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)
+    decision_code: str | None = None
 
-    def __post_init__(self) -> None:
-        if not CASE_ID.fullmatch(self.case_id):
-            raise ValueError("invalid case_id in A2A result")
-        if not self.task_id or not self.actor or not self.decision_code:
-            raise ValueError("A2A result identifiers are required")
-        if self.status not in AGENT_STATUSES:
-            raise ValueError("invalid internal agent status")
-        if self.confidence is not None and (
-            isinstance(self.confidence, bool)
-            or not isinstance(self.confidence, (int, float))
-            or not math.isfinite(self.confidence)
-            or not 0 <= self.confidence <= 1
-        ):
-            raise ValueError("confidence must be a finite number between 0 and 1")
-        validate_evidence_refs(self.evidence_refs)
-
-
-class EntityResolver(Protocol):
-    async def resolve(
-        self, case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
-    ) -> EntityResult: ...
-
-
-class OrderShipmentInvestigator(Protocol):
-    async def investigate(
-        self, entity: EntityResult, gateway: EvidenceGateway, trace: TraceWriter
-    ) -> ShipmentResult: ...
-
-
-class PaymentInvestigator(Protocol):
-    async def check_transactions(
-        self, entity: EntityResult, gateway: EvidenceGateway, trace: TraceWriter
-    ) -> PaymentResult: ...
-
-
-class PolicyResolver(Protocol):
-    async def resolve_conflict(
-        self,
-        case: dict[str, Any],
-        entity: EntityResult,
-        shipment: ShipmentResult,
-        payment: PaymentResult,
-        gateway: EvidenceGateway,
-        trace: TraceWriter,
-    ) -> PolicyResult: ...
-
-
-class OutputVerifier(Protocol):
-    def verify_and_format(
-        self,
-        case: dict[str, Any],
-        entity: EntityResult,
-        shipment: ShipmentResult,
-        payment: PaymentResult,
-        policy: PolicyResult,
-        trace: TraceWriter,
-        claim_assessments: list[ClaimAssessment] | None = None,
-    ) -> dict[str, Any]: ...
+    @classmethod
+    def reply(
+        cls,
+        task: AgentTask,
+        *,
+        status: Status,
+        confidence: float,
+        decision_code: str,
+        data: dict[str, Any] | None = None,
+        evidence_refs: list[str] | None = None,
+        warnings: list[str] | None = None,
+    ) -> AgentResult:
+        return cls(
+            case_id=task.case_id,
+            task_id=task.task_id,
+            actor=task.to_actor,
+            status=status,
+            confidence=round(min(max(confidence, 0.0), 1.0), 4),
+            data=data or {},
+            evidence_refs=list(dict.fromkeys(evidence_refs or [])),
+            warnings=list(dict.fromkeys(warnings or [])),
+            decision_code=decision_code,
+        )

@@ -1,432 +1,433 @@
+"""Coordinator: the only actor that assigns tasks, merges handoffs and finalizes output.
+
+Flow per case (sequential, one shared MCP session):
+
+    entity-agent -> [order-product-agent -> shipment-agent -> payment-refund-agent]
+                 -> policy-agent -> (order-product-agent: verify_seller, only on seller blame)
+                 -> conflict-resolver -> assemble draft -> verifier -> (one repair + re-verify)
+
+Specialists run only when the entity is resolved, so an ambiguous or unknown entity never
+triggers broad MCP scans. All state is per case; nothing is shared between cases.
+"""
+
 from __future__ import annotations
 
-import json
 from copy import deepcopy
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from .a2a import CaseGateway, dispatch, make_task, validate_handoff
-from .agent_types import (
-    AgentResult,
-    AgentTask,
-    EntityResolver,
-    OrderShipmentInvestigator,
-    OutputVerifier,
-    PaymentInvestigator,
-    PolicyResolver,
+from .a2a import A2ABus
+from .agent_types import AgentResult, AgentTask, Status
+from .agents import (
+    run_conflict_resolver,
+    run_entity_customer_agent,
+    run_order_product_agent,
+    run_payment_refund_agent,
+    run_policy_agent,
+    run_seller_verification,
+    run_shipment_agent,
+    run_verifier,
 )
-from .agents import EntityAgent, OrderShipmentAgent, PaymentAgent, PolicyAgent, VerifierAgent
-from .mcp_gateway import EvidenceGateway
-from .state import EntityResult, PaymentResult, PolicyResult, ShipmentResult
-from .trace import TraceWriter
+from .evidence_cache import CaseEvidenceStore, Gateway, TraceSink
+from .money import TOLERANCE, to_brl, to_decimal
+
+SCHEMA_VERSION = "day09-l3b-output-v2"
+MAX_EVIDENCE_REFS = 30
+PAYMENT_ISSUES = {
+    "valid_split_payment",
+    "payment_mismatch",
+    "duplicate_charge",
+    "refund_pending",
+    "refund_failed",
+}
+SHIPMENT_ISSUES = {"late_delivery_seller", "late_delivery_logistics"}
+ISSUE_TOOLS = {
+    "shipment": {"get_order", "get_customer_history", "get_shipment_summary", "get_sellers"},
+    "payment": {"get_order", "get_customer_history", "get_payment_timeline", "get_refund_timeline"},
+    "order": {"get_order", "get_customer_history", "get_order_items", "get_payment_timeline"},
+}
+REFUND_TOOLS = {"get_payment_timeline", "get_refund_timeline", "get_order_items", "get_policy"}
 
 
 @dataclass
-class CoordinatorState:
-    """Per-case state for the typed pipeline."""
-
+class CaseState:
     case_id: str
-    input_case: dict[str, Any]
-    entity: EntityResult | None = None
-    shipment: ShipmentResult | None = None
-    payment: PaymentResult | None = None
-    policy: PolicyResult | None = None
-    verification: AgentResult[dict[str, Any]] | None = None
-    evidence_refs: list[str] = field(default_factory=list)
-    sequence: int = 0
-    completed_tasks: set[str] = field(default_factory=set)
+    case: dict[str, Any]
+    entity: AgentResult | None = None
+    order: AgentResult | None = None
+    shipment: AgentResult | None = None
+    payment: AgentResult | None = None
+    policy: AgentResult | None = None
+    seller_check: AgentResult | None = None
+    conflicts: AgentResult | None = None
+    verification: AgentResult | None = None
+    notes: list[str] = field(default_factory=list)
 
-    def __post_init__(self) -> None:
-        if self.input_case.get("case_id") != self.case_id:
-            raise ValueError("coordinator state case_id differs from input")
 
-    def next_task(
-        self, task_type: str, payload: dict[str, Any] | None = None
-    ) -> AgentTask:
-        self.sequence += 1
-        return make_task(
-            case_id=self.case_id,
-            task_type=task_type,
-            sequence=self.sequence,
-            payload=payload,
-            evidence_refs=tuple(self.evidence_refs),
+class Coordinator:
+    def __init__(self, case: dict[str, Any], gateway: Gateway, trace: TraceSink) -> None:
+        self.case = deepcopy(case)
+        self.case_id = str(self.case["case_id"])
+        self.trace = trace
+        self.contracts = getattr(trace, "contracts", None)
+        self.store = CaseEvidenceStore(self.case_id, gateway, trace)
+        self.bus = A2ABus(self.case_id, trace, self.store)
+        self.state = CaseState(self.case_id, self.case)
+
+    async def _run(self, task_type: str, agent: Any, payload: dict[str, Any]) -> AgentResult:
+        async def handler(task: AgentTask) -> AgentResult:
+            try:
+                return await agent(task, self.store)
+            except Exception as exc:  # noqa: BLE001 - agent failures degrade, never crash a run
+                return AgentResult.reply(
+                    task,
+                    status=Status.ERROR,
+                    confidence=0.0,
+                    decision_code="AGENT_ERROR",
+                    evidence_refs=[],
+                    warnings=[type(exc).__name__],
+                )
+
+        return await self.bus.dispatch(
+            task_type, handler, payload, evidence_refs=self.store.consumed_refs()
         )
 
-    def accept(self, task: AgentTask, result: AgentResult[Any]) -> None:
-        """Store only one correctly correlated typed reply per assignment."""
-        validate_handoff(task, result)
-        if task.case_id != self.case_id:
-            raise ValueError("cannot add a result from another case")
-        if task.task_id in self.completed_tasks:
-            raise ValueError("A2A task was already completed")
-        expected_types = {
-            "resolve_entity": EntityResult,
-            "investigate_order_shipment": ShipmentResult,
-            "investigate_payment_refund": PaymentResult,
-            "decide_policy": PolicyResult,
-            "verify_output": dict,
-        }
-        expected = expected_types[task.task_type]
-        if not isinstance(result.data, expected):
-            raise TypeError(f"{task.task_type} must return {expected.__name__}")
-        target_field = {
-            "resolve_entity": "entity",
-            "investigate_order_shipment": "shipment",
-            "investigate_payment_refund": "payment",
-            "decide_policy": "policy",
-            "verify_output": "verification",
-        }[task.task_type]
-        setattr(self, target_field, result if task.task_type == "verify_output" else result.data)
-        self.evidence_refs = list(dict.fromkeys([*self.evidence_refs, *result.evidence_refs]))
-        self.completed_tasks.add(task.task_id)
+    # ----------------------------------------------------------------- orchestration
+    async def run(self) -> dict[str, Any]:
+        request = self.case.get("customer_request") or {}
+        claims = [claim for claim in request.get("claims") or [] if isinstance(claim, dict)]
+        topics = [str(claim.get("topic")) for claim in claims if claim.get("topic")]
+        state = self.state
 
-
-def start_case(case: dict[str, Any]) -> CoordinatorState:
-    """Create an isolated state before investigating a case."""
-    return CoordinatorState(case_id=case["case_id"], input_case=deepcopy(case))
-
-
-def _check_entity(result: EntityResult) -> None:
-    if result.resolution_status not in {"resolved", "ambiguous", "not_found"}:
-        raise ValueError("entity agent returned an invalid resolution_status")
-    if result.resolution_status == "resolved" and not result.resolved_order_id:
-        raise ValueError("resolved entity must include resolved_order_id")
-    if result.resolution_status != "resolved" and result.resolved_order_id:
-        raise ValueError("unresolved entity cannot select an order")
-
-
-class _ManagedTrace:
-    """Suppress agent-owned coordination events; dispatch owns those events."""
-
-    def __init__(self, writer: TraceWriter, suppressed: set[str] | None = None) -> None:
-        self._writer = writer
-        self._suppressed = suppressed or set()
-
-    def emit(self, **kwargs: Any) -> dict[str, Any]:
-        if kwargs.get("event_type") in self._suppressed:
-            return {}
-        return self._writer.emit(**kwargs)
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._writer, name)
-
-
-def _agent_trace(writer: TraceWriter, *event_types: str) -> _ManagedTrace:
-    return _ManagedTrace(writer, {"task_assigned", "handoff", *event_types})
-
-
-def _invoke_shipment(
-    agent: OrderShipmentInvestigator,
-    entity: EntityResult,
-    gateway: CaseGateway,
-    trace: _ManagedTrace,
-    case_id: str,
-) -> Any:
-    try:
-        return agent.investigate(entity, gateway, trace, case_id=case_id)
-    except TypeError as exc:
-        if "case_id" not in str(exc):
-            raise
-        return agent.investigate(entity, gateway, trace)
-
-
-def _invoke_payment(
-    agent: PaymentInvestigator,
-    entity: EntityResult,
-    gateway: CaseGateway,
-    trace: _ManagedTrace,
-    case: dict[str, Any],
-) -> Any:
-    try:
-        return agent.check_transactions(
-            entity,
-            gateway,
-            trace,
-            case_id=case["case_id"],
-            case=case,
+        state.entity = await self._run(
+            "resolve_entity",
+            run_entity_customer_agent,
+            {
+                "claimed_order_id": request.get("claimed_order_id"),
+                "candidate_order_ids": list(self.case.get("candidate_order_ids") or []),
+                "customer_unique_id_hint": self.case.get("customer_unique_id_hint"),
+                "opened_at": self.case.get("opened_at"),
+            },
         )
-    except TypeError as exc:
-        if "case_id" not in str(exc) and "case" not in str(exc):
-            raise
-        return agent.check_transactions(entity, gateway, trace)
+        entity = state.entity.data
+        resolved = entity.get("resolved_order_ids") or []
+        scoped = entity.get("scoped")
+        if state.entity.status == Status.OK and resolved and scoped is not None:
+            await self._investigate(resolved[0], scoped, topics, claims)
+        draft = self._assemble(claims)
+        return await self._verify(draft)
 
-
-def _check_output(output: dict[str, Any], state: CoordinatorState, trace: TraceWriter) -> None:
-    """Reject output that loses or changes accepted specialist findings."""
-    try:
-        json.dumps(output, allow_nan=False)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("verifier output is not strict JSON") from exc
-    trace.contracts.validate_output(output, "coordinator output")
-    if output["case_id"] != state.case_id:
-        raise ValueError("verifier returned a mismatched case_id")
-    if set(output["evidence_refs"]) != set(state.evidence_refs):
-        raise ValueError("output evidence_refs differ from specialist handoffs")
-    entity, shipment, payment, policy = (
-        state.entity, state.shipment, state.payment, state.policy
-    )
-    if entity is None or shipment is None or payment is None or policy is None:
-        raise ValueError("verification requires all coordinator result slots")
-    if entity.resolved_order_id in entity.rejected_order_ids:
-        raise ValueError("resolved order cannot also be a rejected candidate")
-    if (
-        entity.resolved_order_id
-        and shipment.order_ids
-        and entity.resolved_order_id not in shipment.order_ids
-    ):
-        raise ValueError("shipment orders exclude the resolved order")
-    if len(policy.resolution_actions) > 8:
-        raise ValueError("policy actions exceed output limit; refusing silent truncation")
-    for conflict in policy.data_conflicts:
-        if (
-            conflict.selected_source is not None
-            and conflict.selected_source not in conflict.sources
-        ):
-            raise ValueError("selected conflict source is absent from its sources")
-    financial = policy.financial_resolution
-    line_total = sum(
-        (Decimal(str(line.amount_brl)) for line in financial.refund_lines), Decimal(0)
-    )
-    if abs(line_total - Decimal(str(financial.recommended_refund_brl))) > Decimal("0.005"):
-        raise ValueError("recommended refund differs from refund line total")
-
-    expected = {
-        "assessment": {
-            "primary_issue": policy.primary_issue,
-            "secondary_issues": policy.secondary_issues,
-            "case_status": policy.case_status,
-            "confidence": round(policy.confidence, 4),
-        },
-        "affected_entities": {
-            "order_ids": shipment.order_ids,
-            "item_ids": shipment.item_ids,
-            "seller_ids": shipment.seller_ids,
-            "payment_references": payment.payment_references,
-            "shipment_ids": shipment.shipment_ids,
-        },
-        "entity_resolution": {
-            "status": entity.resolution_status,
-            "resolved_order_ids": [entity.resolved_order_id] if entity.resolved_order_id else [],
-            "rejected_candidates": entity.rejected_order_ids,
-            "confidence": round(entity.confidence, 4),
-        },
-        "customer_context": {
-            "customer_unique_id": entity.customer_unique_id,
-            "related_order_ids": entity.related_order_ids,
-        },
-        "shipment_analysis": {
-            "verdict": shipment.verdict,
-            "late_seller_ids": shipment.late_seller_ids,
-            "timeline_complete": shipment.timeline_complete,
-        },
-        "payment_analysis": {
-            "verdict": payment.verdict,
-            "captured_total_brl": payment.captured_total_brl,
-            "refunded_total_brl": payment.refunded_total_brl,
-            "refundable_total_brl": payment.refundable_total_brl,
-        },
-        "root_cause_analysis": {
-            "ranked_causes": [asdict(cause) for cause in policy.ranked_causes],
-            "responsible_parties": [asdict(party) for party in policy.responsible_parties],
-        },
-        "data_conflicts": [asdict(conflict) for conflict in policy.data_conflicts],
-        "financial_resolution": asdict(financial),
-        "resolution_actions": policy.resolution_actions,
-    }
-    for section, value in expected.items():
-        if output[section] != value:
-            raise ValueError(f"verifier changed specialist result in {section}")
-    claim_assessments = output.get("claim_assessments", [])
-    if len({claim["claim_id"] for claim in claim_assessments}) != len(claim_assessments):
-        raise ValueError("duplicate claim_id in verifier output")
-    for claim in claim_assessments:
-        if not set(claim["evidence_refs"]).issubset(state.evidence_refs):
-            raise ValueError("claim cites evidence absent from accepted handoffs")
-
-
-async def run_case(
-    case: dict[str, Any],
-    gateway: EvidenceGateway,
-    trace: TraceWriter,
-    *,
-    entity_agent: EntityResolver | None = None,
-    order_shipment_agent: OrderShipmentInvestigator | None = None,
-    payment_agent: PaymentInvestigator | None = None,
-    policy_agent: PolicyResolver | None = None,
-    verifier_agent: OutputVerifier | None = None,
-) -> dict[str, Any]:
-    """Route actual typed agent calls in dependency order, with observable A2A."""
-    state = start_case(case)
-    scoped_gateway = CaseGateway(gateway, state.case_id)
-    entity_agent = entity_agent or EntityAgent()
-    order_shipment_agent = order_shipment_agent or OrderShipmentAgent()
-    payment_agent = payment_agent or PaymentAgent()
-    policy_agent = policy_agent or PolicyAgent()
-    verifier_agent = verifier_agent or VerifierAgent()
-
-    entity_task = state.next_task("resolve_entity")
-    entity_reply = await dispatch(
-        entity_task,
-        lambda: entity_agent.resolve(
-            state.input_case,
-            scoped_gateway,
-            _agent_trace(trace),
-        ),
-        EntityResult,
-        lambda value: {
-            "resolved": "ok",
-            "ambiguous": "ambiguous",
-            "not_found": "insufficient_evidence",
-        }[value.resolution_status],
-        lambda value: {
-            "resolved": "ENTITY_RESOLVED",
-            "ambiguous": "ENTITY_AMBIGUOUS",
-            "not_found": "ENTITY_NOT_FOUND",
-        }[value.resolution_status],
-        scoped_gateway,
-        trace,
-        validate=_check_entity,
-    )
-    state.accept(entity_task, entity_reply)
-
-    if state.entity is not None and state.entity.resolution_status == "resolved":
-        scope = {"resolved_order_id": state.entity.resolved_order_id}
-        shipment_task = state.next_task("investigate_order_shipment", scope)
-        shipment_reply = await dispatch(
-            shipment_task,
-            lambda: _invoke_shipment(
-                order_shipment_agent,
-                state.entity,
-                scoped_gateway,
-                _agent_trace(trace),
-                state.case_id,
-            ),
-            ShipmentResult,
-            lambda value: (
-                "insufficient_evidence" if value.verdict == "insufficient_evidence" else "ok"
-            ),
-            lambda value: (
-                "SHIPMENT_INSUFFICIENT_EVIDENCE"
-                if value.verdict == "insufficient_evidence"
-                else "SHIPMENT_ANALYZED"
-            ),
-            scoped_gateway,
-            trace,
+    async def _investigate(
+        self, order_id: str, scoped: Any, topics: list[str], claims: list[dict[str, Any]]
+    ) -> None:
+        state = self.state
+        scope = self.case.get("investigation_scope") or {}
+        state.order = await self._run(
+            "investigate_order",
+            run_order_product_agent,
+            {
+                "order_id": order_id,
+                "window": scoped.window,
+                "scoped_row": scoped.row,
+                "include_product_context": scope.get("include_product_context", True),
+            },
         )
-        state.accept(shipment_task, shipment_reply)
-
-        payment_task = state.next_task("investigate_payment_refund", scope)
-        payment_reply = await dispatch(
-            payment_task,
-            lambda: _invoke_payment(
-                payment_agent,
-                state.entity,
-                scoped_gateway,
-                _agent_trace(trace),
-                state.input_case,
-            ),
-            PaymentResult,
-            lambda value: (
-                "insufficient_evidence" if value.verdict == "insufficient_evidence" else "ok"
-            ),
-            lambda value: (
-                "PAYMENT_INSUFFICIENT_EVIDENCE"
-                if value.verdict == "insufficient_evidence"
-                else "PAYMENT_ANALYZED"
-            ),
-            scoped_gateway,
-            trace,
+        state.shipment = await self._run(
+            "investigate_shipment",
+            run_shipment_agent,
+            {"order_id": order_id, "window": scoped.window, "scoped_row": scoped.row},
         )
-        state.accept(payment_task, payment_reply)
-
-        policy_task = state.next_task("decide_policy", scope)
-        policy_reply = await dispatch(
-            policy_task,
-            lambda: policy_agent.resolve_conflict(
-                state.input_case,
-                state.entity,
-                state.shipment,
-                state.payment,
-                scoped_gateway,
-                _agent_trace(trace, "policy_decided"),
-            ),
-            PolicyResult,
-            lambda value: (
-                "insufficient_evidence"
-                if value.primary_issue == "insufficient_evidence"
-                else "ok"
-            ),
-            lambda value: (
-                "POLICY_INSUFFICIENT_EVIDENCE"
-                if value.primary_issue == "insufficient_evidence"
-                else "POLICY_DECIDED"
-            ),
-            scoped_gateway,
-            trace,
+        state.payment = await self._run(
+            "investigate_payment",
+            run_payment_refund_agent,
+            {
+                "order_id": order_id,
+                "window": scoped.window,
+                "order_value": state.order.data.get("order_value"),
+                "claim_topics": topics,
+            },
         )
-        state.accept(policy_task, policy_reply)
-        if state.policy is not None and (
-            state.policy.primary_issue != "insufficient_evidence"
-            and state.policy.evidence_refs
-        ):
-            trace.emit(
-                case_id=state.case_id,
-                event_type="policy_decided",
-                actor="policy-agent",
-                target="coordinator",
-                decision_code="POLICY_DECIDED",
-                evidence_refs=state.policy.evidence_refs[:20],
+        facts = self._facts(order_id, scoped)
+        state.policy = await self._run(
+            "decide_policy",
+            run_policy_agent,
+            {
+                "facts": facts,
+                "claim_topics": topics,
+                "claims": claims,
+                "policy_version": self.case.get("policy_version") or "",
+                "evidence_confidence": state.entity.confidence,
+            },
+        )
+        parties = state.policy.data.get("responsible_parties", [])
+        blamed = [p["party_id"] for p in parties if p["party_type"] == "seller" and p["party_id"]]
+        if blamed:
+            state.seller_check = await self._run(
+                "verify_seller",
+                run_seller_verification,
+                {"order_id": order_id, "seller_ids": blamed},
             )
-    else:
-        # No order scope: leave these domains explicitly without evidence.
-        state.shipment = ShipmentResult()
-        state.payment = PaymentResult()
-        state.policy = PolicyResult()
-
-    verifier_task = state.next_task("verify_output")
-    try:
-        verifier_reply = await dispatch(
-            verifier_task,
-            lambda: verifier_agent.verify_and_format(
-                state.input_case,
-                state.entity,
-                state.shipment,
-                state.payment,
-                state.policy,
-                _agent_trace(trace, "verification_completed"),
-            ),
-            dict,
-            lambda _value: "ok",
-            lambda _value: "VERIFY_CONSISTENCY_PASS",
-            scoped_gateway,
-            trace,
-            validate=lambda output: _check_output(output, state, trace),
+            unknown = set(state.seller_check.data.get("unknown_seller_ids", []))
+            if unknown:
+                parties = [
+                    {**p, "party_id": None} if p["party_id"] in unknown else p for p in parties
+                ]
+        candidates = [
+            *state.entity.data.get("conflict_candidates", []),
+            *(state.shipment.data.get("conflict_candidates", []) if state.shipment else []),
+            *(state.payment.data.get("conflict_candidates", []) if state.payment else []),
+        ]
+        state.conflicts = await self._run(
+            "resolve_conflicts",
+            run_conflict_resolver,
+            {
+                "conflict_candidates": candidates,
+                "responsible_parties": parties,
+                "seller_ids": state.order.data.get("seller_ids", []),
+                "shipment_verdict": self._shipment()["verdict"],
+                "primary_issue": state.policy.data.get("primary_issue"),
+                "supporting_refs": [
+                    ref
+                    for ref in (
+                        state.entity.data.get("history_ref"),
+                        state.entity.data.get("order_ref"),
+                        *(state.shipment.evidence_refs if state.shipment else []),
+                    )
+                    if ref
+                ],
+            },
         )
-    except Exception:
-        trace.emit(
-            case_id=state.case_id,
-            event_type="verification_completed",
-            actor="verifier",
-            target="coordinator",
-            decision_code="VERIFY_FAIL",
-            attributes={"scope": "schema_provenance_consistency", "error_count": 1},
+
+    def _facts(self, order_id: str, scoped: Any) -> dict[str, Any]:
+        state = self.state
+        order = state.order.data if state.order else {}
+        payment = state.payment.data if state.payment else {}
+        payment_facts = payment.get("facts") or {}
+        shipment = self._shipment()
+        return {
+            "entity_status": state.entity.data.get("status"),
+            "order_id": order_id,
+            "order_status": scoped.row.get("order_status"),
+            "seller_ids": order.get("seller_ids", []),
+            "late_seller_ids": shipment["late_seller_ids"],
+            "shipment_verdict": shipment["verdict"],
+            "payment_verdict": self._payment()["verdict"],
+            "captured": payment_facts.get("captured"),
+            "refundable": payment_facts.get("refundable"),
+            "split": payment_facts.get("split", False),
+            "duplicate_amount": payment_facts.get("duplicate_amount"),
+            "mismatch_amount": payment_facts.get("mismatch_amount"),
+            "failed_refund_amount": payment_facts.get("failed_refund_amount"),
+            "freight_total": order.get("freight_total"),
+        }
+
+    # ----------------------------------------------------------------- assembly
+    def _shipment(self) -> dict[str, Any]:
+        result = self.state.shipment
+        if result and result.status != Status.ERROR and "shipment_analysis" in result.data:
+            return dict(result.data["shipment_analysis"])
+        return {
+            "verdict": "insufficient_evidence",
+            "late_seller_ids": [],
+            "timeline_complete": False,
+        }
+
+    def _payment(self) -> dict[str, Any]:
+        result = self.state.payment
+        if result and result.status != Status.ERROR and "payment_analysis" in result.data:
+            return dict(result.data["payment_analysis"])
+        return {
+            "verdict": "insufficient_evidence",
+            "captured_total_brl": None,
+            "refunded_total_brl": None,
+            "refundable_total_brl": None,
+        }
+
+    def _issue_confidence(self, issue: str) -> float:
+        state = self.state
+        confidence = state.policy.confidence if state.policy else 0.3
+        domain = None
+        if issue in SHIPMENT_ISSUES:
+            domain = state.shipment
+        elif issue in PAYMENT_ISSUES:
+            domain = state.payment
+        elif issue in {"canceled_order_paid", "unavailable_order_paid"}:
+            domain = state.order
+        if domain is not None:
+            confidence = min(confidence, max(domain.confidence, 0.3))
+        if state.conflicts and state.conflicts.data.get("unresolved"):
+            confidence = min(confidence, 0.7)
+        return round(confidence, 4)
+
+    def _claim_refs(self, kind: str, issue: str) -> list[str]:
+        if kind == "refund":
+            tools = REFUND_TOOLS
+        elif issue in SHIPMENT_ISSUES or issue == "unsupported_claim":
+            tools = ISSUE_TOOLS["shipment"] | {"get_payment_timeline", "get_policy"}
+        elif issue in PAYMENT_ISSUES:
+            tools = ISSUE_TOOLS["payment"] | {"get_order_items", "get_policy"}
+        else:
+            tools = ISSUE_TOOLS["order"] | {"get_policy"}
+        refs = []
+        for ref in self.store.consumed_refs():
+            evidence = self.store.get(ref)
+            if evidence is not None and evidence.tool in tools:
+                refs.append(ref)
+        return refs[:MAX_EVIDENCE_REFS]
+
+    def _assemble(self, claims: list[dict[str, Any]]) -> dict[str, Any]:
+        state = self.state
+        entity = state.entity.data if state.entity else {}
+        order = state.order.data if state.order and state.order.status != Status.ERROR else {}
+        payment = (
+            state.payment.data if state.payment and state.payment.status != Status.ERROR else {}
         )
-        raise
-    state.accept(verifier_task, verifier_reply)
-    trace.emit(
-        case_id=state.case_id,
-        event_type="verification_completed",
-        actor="verifier",
-        target="coordinator",
-        decision_code="VERIFY_CONSISTENCY_PASS",
-        attributes={"scope": "schema_provenance_consistency", "error_count": 0},
-    )
-    return verifier_reply.data
+        policy = state.policy.data if state.policy and state.policy.status != Status.ERROR else {}
+        conflicts = state.conflicts.data if state.conflicts else {}
+
+        issue = policy.get("primary_issue", "insufficient_evidence")
+        case_status = policy.get("case_status", "needs_investigation")
+        action = policy.get("recommended_action", "escalate_investigation")
+        refund: Decimal = policy.get("recommended_refund", Decimal(0))
+        parties = (
+            conflicts.get("responsible_parties")
+            or policy.get("responsible_parties")
+            or [{"party_type": "unknown", "party_id": None}]
+        )
+        confidence = self._issue_confidence(issue) if policy else 0.3
+
+        claim_assessments = []
+        for verdict in policy.get("claim_verdicts", []):
+            if not verdict.get("claim_id"):
+                continue
+            refs = self._claim_refs(verdict["kind"], issue)
+            claim_confidence = confidence if verdict["verdict"] != "insufficient_evidence" else 0.5
+            claim_assessments.append(
+                {
+                    "claim_id": str(verdict["claim_id"])[:64],
+                    "verdict": verdict["verdict"],
+                    "confidence": round(claim_confidence, 4),
+                    "evidence_refs": refs,
+                }
+            )
+        if not claim_assessments and claims and issue == "insufficient_evidence":
+            claim_assessments = [
+                {
+                    "claim_id": str(claim.get("claim_id"))[:64],
+                    "verdict": "insufficient_evidence",
+                    "confidence": 0.3,
+                    "evidence_refs": [],
+                }
+                for claim in claims[:5]
+                if claim.get("claim_id")
+            ]
+
+        output = {
+            "schema_version": SCHEMA_VERSION,
+            "case_id": self.case_id,
+            "assessment": {
+                "primary_issue": issue,
+                "secondary_issues": [],
+                "case_status": case_status,
+                "confidence": confidence,
+            },
+            "affected_entities": {
+                "order_ids": list(entity.get("resolved_order_ids") or []),
+                "item_ids": order.get("item_ids", [])[:20],
+                "seller_ids": order.get("seller_ids", [])[:20],
+                "payment_references": payment.get("payment_references", [])[:20],
+                "shipment_ids": [],
+            },
+            "claim_assessments": claim_assessments,
+            "entity_resolution": {
+                "status": entity.get("status", "not_found"),
+                "resolved_order_ids": list(entity.get("resolved_order_ids") or []),
+                "rejected_candidates": list(entity.get("rejected_candidates") or [])[:20],
+                "confidence": state.entity.confidence if state.entity else 0.0,
+            },
+            "customer_context": {
+                "customer_unique_id": entity.get("customer_unique_id"),
+                "related_order_ids": list(entity.get("related_order_ids") or [])[:20],
+            },
+            "shipment_analysis": self._shipment(),
+            "payment_analysis": self._payment(),
+            "root_cause_analysis": {
+                "ranked_causes": policy.get(
+                    "ranked_causes", [{"cause_code": "INSUFFICIENT_EVIDENCE", "rank": 1}]
+                ),
+                "responsible_parties": parties,
+            },
+            "evidence_refs": self.store.consumed_refs()[:MAX_EVIDENCE_REFS],
+            "data_conflicts": conflicts.get("data_conflicts", []),
+            "financial_resolution": {
+                "currency": "BRL",
+                "recommended_refund_brl": to_brl(refund) or 0.0,
+                "refund_lines": policy.get("refund_lines", []),
+            },
+            "resolution_actions": [action],
+        }
+        if not output["claim_assessments"]:
+            del output["claim_assessments"]
+        return output
+
+    # ----------------------------------------------------------------- verification
+    async def _verify(self, draft: dict[str, Any]) -> dict[str, Any]:
+        scoped = self.state.entity.data.get("scoped") if self.state.entity else None
+        payload = {
+            "case": self.case,
+            "contracts": self.contracts,
+            "scoped_purchase": scoped.row.get("order_purchase_timestamp") if scoped else None,
+        }
+        result = await self._run("verify_output", run_verifier, {**payload, "output": draft})
+        self.state.verification = result
+        if result.data.get("valid"):
+            return draft
+        repaired = repair(draft, result.data.get("errors", []), set(self.store.consumed_refs()))
+        result = await self._run("verify_output", run_verifier, {**payload, "output": repaired})
+        self.state.verification = result
+        if not result.data.get("valid"):
+            repaired["assessment"]["case_status"] = "needs_investigation"
+            repaired["assessment"]["confidence"] = min(repaired["assessment"]["confidence"], 0.4)
+        return repaired
 
 
-async def solve_case(
-    case: dict[str, Any], gateway: EvidenceGateway, trace: TraceWriter
-) -> dict[str, Any]:
-    """CLI entrypoint for Sang's coordinator."""
-    return await run_case(case, gateway, trace)
+def repair(output: dict[str, Any], errors: list[str], consumed: set[str]) -> dict[str, Any]:
+    """Deterministic, bounded fixes for verifier findings; never invents new facts."""
+    fixed = deepcopy(output)
+    fixed["evidence_refs"] = [
+        ref for ref in dict.fromkeys(fixed["evidence_refs"]) if ref in consumed
+    ]
+    for claim in fixed.get("claim_assessments", []):
+        claim["evidence_refs"] = [ref for ref in claim["evidence_refs"] if ref in consumed]
+    fixed["resolution_actions"] = list(dict.fromkeys(fixed["resolution_actions"]))
+    payment = fixed["payment_analysis"]
+    financial = fixed["financial_resolution"]
+    refundable = to_decimal(payment.get("refundable_total_brl"))
+    recommended = to_decimal(financial["recommended_refund_brl"]) or Decimal(0)
+    if refundable is not None and recommended > refundable + TOLERANCE:
+        recommended = refundable
+    if fixed["assessment"]["case_status"] == "no_action" or payment["verdict"] == "refunded":
+        recommended = Decimal(0)
+    financial["recommended_refund_brl"] = to_brl(recommended) or 0.0
+    lines = financial["refund_lines"][:1]
+    if recommended > 0 and lines:
+        lines[0]["amount_brl"] = to_brl(recommended)
+    financial["refund_lines"] = lines if recommended > 0 else []
+    sellers = set(fixed["affected_entities"]["seller_ids"])
+    shipment = fixed["shipment_analysis"]
+    shipment["late_seller_ids"] = [s for s in shipment["late_seller_ids"] if s in sellers]
+    if shipment["verdict"] != "seller_delay":
+        shipment["late_seller_ids"] = []
+    for party in fixed["root_cause_analysis"]["responsible_parties"]:
+        if party["party_type"] == "seller" and party["party_id"] not in sellers:
+            party["party_id"] = None
+    if any(error.endswith("not_reproducible") for error in errors):
+        fixed["assessment"]["case_status"] = "needs_investigation"
+        fixed["assessment"]["confidence"] = min(fixed["assessment"]["confidence"], 0.5)
+    return fixed
+
+
+async def solve_case(case: dict[str, Any], gateway: Gateway, trace: TraceSink) -> dict[str, Any]:
+    """Entry point used by ``day09 run``: coordinate all agents for one case."""
+    return await Coordinator(case, gateway, trace).run()

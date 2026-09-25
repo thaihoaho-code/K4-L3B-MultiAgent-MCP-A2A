@@ -1,169 +1,124 @@
-"""Coordinator-mediated A2A calls and case-scoped evidence handoffs."""
+"""A2A protocol: the coordinator is the only task sender and every reply is validated.
+
+``A2ABus`` emits ``task_assigned`` when a task leaves the coordinator and ``handoff`` only
+after the reply is correlated (same case, same task id, expected actor, valid status and
+confidence, evidence issued for this case). Each task type runs at most ``max_runs_per_type``
+times and a case can issue at most ``max_tasks`` tasks, so agents can never loop.
+"""
 
 from __future__ import annotations
 
-import inspect
+from collections import Counter
 from collections.abc import Awaitable, Callable
-from typing import Any, TypeVar
+from dataclasses import dataclass, field
+from typing import Any
 
-from .agent_types import AgentResult, AgentTask
-from .mcp_gateway import EvidenceGateway
-from .trace import TraceWriter
+from .agent_types import COORDINATOR, TASK_ROUTES, AgentResult, AgentTask, Status
+from .evidence_cache import CaseEvidenceStore, TraceSink
 
-ResultT = TypeVar("ResultT")
-
-# Names reflect the actual combined agents in the user-approved pipeline.
-TASK_ACTORS = {
-    "resolve_entity": "entity-agent",
-    "investigate_order_shipment": "order-shipment-agent",
-    "investigate_payment_refund": "payment-refund-agent",
-    "decide_policy": "policy-agent",
-    "verify_output": "verifier",
-}
-ASSIGNMENT_CODES = {
-    "resolve_entity": "RESOLVE_ENTITY",
-    "investigate_order_shipment": "INVESTIGATE_ORDER_SHIPMENT",
-    "investigate_payment_refund": "INVESTIGATE_PAYMENT",
-    "decide_policy": "CHECK_POLICY",
-    "verify_output": "VERIFY_OUTPUT",
-}
+Handler = Callable[[AgentTask], Awaitable[AgentResult]]
 
 
-def make_task(
-    *,
-    case_id: str,
-    task_type: str,
-    sequence: int,
-    payload: dict[str, Any] | None = None,
-    evidence_refs: tuple[str, ...] = (),
-) -> AgentTask:
-    """Build a small, case-correlated assignment envelope."""
-    if task_type not in TASK_ACTORS:
-        raise ValueError(f"unknown A2A task type: {task_type}")
-    if sequence < 1:
-        raise ValueError("A2A task sequence must be positive")
-    return AgentTask(
-        case_id=case_id,
-        task_id=f"{case_id}:{sequence}:{task_type}",
-        from_actor="coordinator",
-        to_actor=TASK_ACTORS[task_type],
-        task_type=task_type,
-        payload=dict(payload or {}),
-        evidence_refs=evidence_refs,
-    )
+class HandoffError(ValueError):
+    pass
 
 
-def validate_handoff(task: AgentTask, result: AgentResult[Any]) -> None:
-    """Reject a reply from another case, task, or actor."""
-    if task.task_type not in TASK_ACTORS or task.from_actor != "coordinator":
-        raise ValueError("A2A task route is invalid")
-    if task.to_actor != TASK_ACTORS[task.task_type]:
-        raise ValueError("A2A task recipient does not match task type")
-    if (
-        result.case_id != task.case_id
-        or result.task_id != task.task_id
-        or result.actor != task.to_actor
-    ):
-        raise ValueError("A2A handoff case, task, or actor mismatch")
+@dataclass
+class A2ABus:
+    case_id: str
+    trace: TraceSink
+    store: CaseEvidenceStore
+    max_tasks: int = 14
+    max_runs_per_type: int = 2
+    _sequence: int = 0
+    _open: dict[str, AgentTask] = field(default_factory=dict)
+    _runs: Counter[str] = field(default_factory=Counter)
+    results: list[AgentResult] = field(default_factory=list)
 
+    def assign(
+        self,
+        task_type: str,
+        payload: dict[str, Any] | None = None,
+        evidence_refs: list[str] | tuple[str, ...] = (),
+    ) -> AgentTask:
+        route = TASK_ROUTES.get(task_type)
+        if route is None:
+            raise HandoffError(f"unknown task type {task_type!r}")
+        if self._sequence >= self.max_tasks:
+            raise HandoffError(f"{self.case_id}: task budget exhausted")
+        if self._runs[task_type] >= self.max_runs_per_type:
+            raise HandoffError(f"{self.case_id}: {task_type} exceeded its run limit")
+        self._sequence += 1
+        self._runs[task_type] += 1
+        task = AgentTask(
+            case_id=self.case_id,
+            task_id=f"T{self._sequence:02d}",
+            from_actor=COORDINATOR,
+            to_actor=route.actor,
+            task_type=task_type,
+            payload=dict(payload or {}),
+            evidence_refs=tuple(dict.fromkeys(evidence_refs)),
+        )
+        self._open[task.task_id] = task
+        self.trace.emit(
+            case_id=self.case_id,
+            event_type="task_assigned",
+            actor=COORDINATOR,
+            target=route.actor,
+            decision_code=route.assign_code,
+            attributes={"task_id": task.task_id},
+        )
+        return task
 
-def wrap_result(
-    task: AgentTask,
-    data: ResultT,
-    *,
-    status: str,
-    decision_code: str,
-    evidence_refs: tuple[str, ...] = (),
-    confidence: float | None = None,
-    warnings: tuple[str, ...] = (),
-) -> AgentResult[ResultT]:
-    """Wrap a typed specialist value without changing its current method signature."""
-    result = AgentResult(
-        case_id=task.case_id,
-        task_id=task.task_id,
-        actor=task.to_actor,
-        status=status,
-        data=data,
-        evidence_refs=evidence_refs,
-        decision_code=decision_code,
-        confidence=confidence,
-        warnings=warnings,
-    )
-    validate_handoff(task, result)
-    return result
-
-
-class CaseGateway(EvidenceGateway):
-    """Route all calls through one case and remember server-issued refs."""
-
-    def __init__(self, gateway: EvidenceGateway, case_id: str) -> None:
-        self._gateway = gateway
-        self.case_id = case_id
-        self.observed_refs: dict[str, str] = {}
-
-    async def list_tools(self) -> list[str]:
-        return await self._gateway.list_tools()
-
-    async def call(self, tool_name: str, *, case_id: str, **arguments: str) -> dict[str, Any]:
-        if case_id != self.case_id:
-            raise ValueError("MCP call attempted another case_id")
-        evidence = await self._gateway.call(tool_name, case_id=case_id, **arguments)
-        self.observed_refs[evidence["evidence_ref"]] = tool_name
-        return evidence
-
-
-async def dispatch(
-    task: AgentTask,
-    invoke: Callable[[], Awaitable[ResultT] | ResultT],
-    expected_type: type[ResultT],
-    status: Callable[[ResultT], str],
-    decision_code: Callable[[ResultT], str],
-    gateway: CaseGateway,
-    trace: TraceWriter,
-    validate: Callable[[ResultT], None] | None = None,
-) -> AgentResult[ResultT]:
-    """Trace a real assignment and only hand off a valid result."""
-    if task.case_id != gateway.case_id or task.to_actor != TASK_ACTORS[task.task_type]:
-        raise ValueError("A2A task case or route mismatch")
-    trace.emit(
-        case_id=task.case_id,
-        event_type="task_assigned",
-        actor="coordinator",
-        target=task.to_actor,
-        decision_code=ASSIGNMENT_CODES[task.task_type],
-        attributes={"task_id": task.task_id},
-    )
-    raw = invoke()
-    data = await raw if inspect.isawaitable(raw) else raw
-    if not isinstance(data, expected_type):
-        raise TypeError(f"{task.to_actor} must return {expected_type.__name__}")
-    refs = data.get("evidence_refs", []) if isinstance(data, dict) else data.evidence_refs
-    if not isinstance(refs, list):
-        raise TypeError("specialist evidence_refs must be a list")
-    if any(ref not in gateway.observed_refs for ref in refs):
-        raise ValueError("specialist evidence_ref was not observed in this case")
-    if validate is not None:
-        validate(data)
-    result = wrap_result(
-        task,
-        data,
-        status=status(data),
-        decision_code=decision_code(data),
-        evidence_refs=tuple(refs),
-        confidence=getattr(data, "confidence", None),
-    )
-    trace.emit(
-        case_id=task.case_id,
-        event_type="handoff",
-        actor=task.to_actor,
-        target="coordinator",
-        decision_code=result.decision_code,
-        evidence_refs=list(result.evidence_refs[:20]),
-        attributes={
+    def accept(self, task: AgentTask, result: AgentResult) -> AgentResult:
+        self._validate(task, result)
+        del self._open[task.task_id]
+        self.results.append(result)
+        attributes: dict[str, str | int | float | bool | None] = {
             "task_id": task.task_id,
-            "status": result.status,
-            "evidence_count": len(result.evidence_refs),
+            "status": str(result.status),
             "confidence": result.confidence,
-        },
-    )
-    return result
+        }
+        self.trace.emit(
+            case_id=self.case_id,
+            event_type="handoff",
+            actor=result.actor,
+            target=COORDINATOR,
+            decision_code=result.decision_code,
+            evidence_refs=result.evidence_refs[:20] or None,
+            attributes=attributes,
+        )
+        return result
+
+    async def dispatch(
+        self,
+        task_type: str,
+        handler: Handler,
+        payload: dict[str, Any] | None = None,
+        evidence_refs: list[str] | tuple[str, ...] = (),
+    ) -> AgentResult:
+        task = self.assign(task_type, payload, evidence_refs)
+        result = await handler(task)
+        return self.accept(task, result)
+
+    def _validate(self, task: AgentTask, result: AgentResult) -> None:
+        if task.task_id not in self._open:
+            raise HandoffError(f"{task.task_id} is not an open task")
+        if result.case_id != self.case_id or task.case_id != self.case_id:
+            raise HandoffError("handoff case_id does not match the active case")
+        if result.task_id != task.task_id:
+            raise HandoffError("handoff task_id does not match the assignment")
+        if result.actor != task.to_actor:
+            raise HandoffError(f"{result.actor} answered a task assigned to {task.to_actor}")
+        if not isinstance(result.status, Status):
+            raise HandoffError("handoff status is not an A2A status")
+        if not 0.0 <= result.confidence <= 1.0:
+            raise HandoffError("handoff confidence is outside [0, 1]")
+        if not result.decision_code:
+            raise HandoffError("handoff requires a decision code")
+        foreign = [ref for ref in result.evidence_refs if not self.store.owns(ref)]
+        if foreign:
+            raise HandoffError(f"handoff cites evidence not issued for this case: {foreign}")
+        unconsumed = set(result.evidence_refs) - set(self.store.consumed_refs())
+        if unconsumed:
+            raise HandoffError(f"handoff cites evidence never consumed: {sorted(unconsumed)}")
