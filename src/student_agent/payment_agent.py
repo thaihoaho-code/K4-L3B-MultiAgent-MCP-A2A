@@ -18,6 +18,8 @@ _CENT = Decimal("0.01")
 _ZERO = Decimal("0")
 
 _PAYMENT_TOOL_PREFERENCES = (
+    "get_payment_timeline",
+    "get_order_payments",
     "get_payment_details",
     "get_payment_history",
     "get_payment_records",
@@ -25,6 +27,7 @@ _PAYMENT_TOOL_PREFERENCES = (
     "check_payment",
 )
 _REFUND_TOOL_PREFERENCES = (
+    "get_refund_timeline",
     "get_refund_status",
     "get_refund_details",
     "get_refund_records",
@@ -39,6 +42,10 @@ _PAYMENT_CONTAINERS = (
     "capture_records",
     "transactions",
     "transaction_records",
+    "payment_events",
+    "payment_timeline",
+    "lifecycle_events",
+    "events",
     "ledger",
     "records",
     "data",
@@ -47,6 +54,9 @@ _REFUND_CONTAINERS = (
     "refunds",
     "refund_records",
     "refund_events",
+    "refund_timeline",
+    "lifecycle_events",
+    "events",
     "transactions",
     "records",
     "data",
@@ -167,9 +177,11 @@ def _looks_like_record(value: Mapping[str, Any]) -> bool:
         "captured_amount",
         "captured_amount_brl",
         "captured_total",
+        "event_type",
         "id",
         "is_duplicate",
         "payment_id",
+        "payment_value",
         "payment_reference",
         "refund_status",
         "status",
@@ -211,7 +223,16 @@ def _record_status(record: Mapping[str, Any]) -> str:
     return _text(
         _first_value(
             record,
-            ("status", "payment_status", "capture_status", "refund_status", "state", "result"),
+            (
+                "status",
+                "payment_status",
+                "capture_status",
+                "refund_status",
+                "state",
+                "result",
+                "event_type",
+                "event",
+            ),
         )
     ).replace("-", "_").replace(" ", "_")
 
@@ -256,6 +277,8 @@ def _capture_amount(record: Mapping[str, Any]) -> Decimal | None:
             "captured_amount",
             "capture_amount_brl",
             "capture_amount",
+            "payment_value_brl",
+            "payment_value",
             "amount_brl",
             "amount",
             "value_brl",

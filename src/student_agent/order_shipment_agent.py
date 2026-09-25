@@ -8,6 +8,183 @@ from .mcp_gateway import EvidenceGateway
 from .state import EntityResult, ShipmentResult
 from .trace import TraceWriter
 
+_ACTOR = "order_shipment_agent"
+_VALID_VERDICTS = {
+    "on_time",
+    "seller_delay",
+    "logistics_delay",
+    "lost",
+    "returned",
+    "conflicting",
+    "insufficient_evidence",
+}
+
+
+async def _available_tools(gateway: EvidenceGateway) -> list[str] | None:
+    method = getattr(gateway, "list_tools", None)
+    if method is None:
+        return None
+    try:
+        result = method()
+        if inspect.isawaitable(result):
+            result = await result
+    except Exception:  # noqa: BLE001 - missing discovery is treated as missing evidence
+        return []
+    return [str(name) for name in (result or [])]
+
+
+def _choose_tool(available: list[str] | None, preferred: str) -> str | None:
+    if available is None:
+        return preferred
+    return preferred if preferred in available else None
+
+
+def _trace_evidence(
+    trace: TraceWriter,
+    case_id: str,
+    tool_name: str,
+    evidence: Any,
+) -> list[str]:
+    reference = evidence_ref(evidence)
+    if reference is None:
+        return []
+    trace.emit(
+        case_id=case_id,
+        event_type="tool_result_consumed",
+        actor=_ACTOR,
+        tool_name=tool_name,
+        evidence_refs=[reference],
+    )
+    return [reference]
+
+
+def _case_id(
+    entity: EntityResult, case_id: str | None, case: Mapping[str, Any] | None
+) -> str | None:
+    for value in (case_id, case.get("case_id") if case else None):
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _ids(data: Any, keys: tuple[str, ...], plural: tuple[str, ...] = ()) -> list[str]:
+    return collect_identifiers(data, keys, plural)
+
+
+def _seller_ids_for_late_records(data: Any) -> list[str]:
+    late_ids: list[str] = []
+    for mapping in walk_mappings(data):
+        fields = {
+            normalise_field(key): str(value).lower()
+            for key, value in mapping.items()
+            if isinstance(value, (str, int, float, bool))
+        }
+        joined = " ".join(fields.values())
+        source = " ".join(
+            fields.get(key, "")
+            for key in ("delay_source", "responsible_party", "responsibility", "late_party")
+        )
+        is_late = any(token in joined for token in ("late", "delay", "overdue"))
+        seller_source = any(token in source for token in ("seller", "merchant", "vendor"))
+        if is_late and seller_source:
+            late_ids.extend(
+                _ids(
+                    mapping,
+                    ("seller_id", "merchant_id", "vendor_id"),
+                    ("seller_ids",),
+                )
+            )
+    return unique_strings(late_ids)
+
+
+def _explicit_verdict(data: Any) -> tuple[str | None, bool]:
+    raw_values = collect_texts(
+        data,
+        ("shipment_verdict", "delivery_verdict", "verdict", "shipment_result"),
+    )
+    values = [value for value in raw_values if value in _VALID_VERDICTS]
+    if not values:
+        return None, False
+    return values[0], len(set(values)) > 1
+
+
+def _derive_verdict(data: Any) -> tuple[str, bool, list[str]]:
+    explicit, conflicting = _explicit_verdict(data)
+    statuses = set(
+        collect_texts(
+            data,
+            (
+                "shipment_status",
+                "delivery_status",
+                "order_status",
+                "status",
+                "state",
+                "event_type",
+                "delay_source",
+                "responsible_party",
+            ),
+        )
+    )
+    late_flags = collect_bools(data, ("is_late", "late", "delayed", "overdue"))
+    late_text = any(
+        any(token in value for token in ("late", "delay", "overdue"))
+        for value in statuses
+    )
+    seller_late_ids = _seller_ids_for_late_records(data)
+    seller_text = any(
+        token in value
+        for value in statuses
+        for token in ("seller", "merchant", "vendor")
+    )
+    logistics_text = any(
+        token in value
+        for value in statuses
+        for token in ("logistic", "carrier", "shipping_provider", "transport")
+    )
+    if explicit is not None:
+        return ("conflicting" if conflicting else explicit), True, seller_late_ids
+    if "lost" in statuses or "undeliverable" in statuses:
+        return "lost", True, seller_late_ids
+    if "returned" in statuses or "return_to_sender" in statuses:
+        return "returned", True, seller_late_ids
+    if late_text or any(late_flags):
+        if seller_late_ids or seller_text:
+            return "seller_delay", True, seller_late_ids
+        if logistics_text:
+            return "logistics_delay", True, seller_late_ids
+        return "logistics_delay", True, seller_late_ids
+
+    delivered = any(
+        value in {"delivered", "delivery_completed", "completed", "complete"}
+        for value in statuses
+    )
+    actual_delivery = first_datetime(
+        data,
+        (
+            "delivered_at",
+            "delivery_date",
+            "delivered_customer_at",
+            "order_delivered_customer_date",
+        ),
+    )
+    expected_delivery = first_datetime(
+        data,
+        (
+            "estimated_delivery_date",
+            "expected_delivery_date",
+            "promised_delivery_date",
+            "delivery_limit_date",
+            "order_estimated_delivery_date",
+        ),
+    )
+    if actual_delivery is not None and expected_delivery is not None:
+        if actual_delivery > expected_delivery:
+            return "logistics_delay", True, seller_late_ids
+        return "on_time", True, seller_late_ids
+    if delivered:
+        return "on_time", actual_delivery is not None, seller_late_ids
+    return "insufficient_evidence", False, seller_late_ids
+
 
 @dataclass(frozen=True)
 class SpecialistTools:

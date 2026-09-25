@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-
 # ---------------------------------------------------------------------------
 # EntityAgent → OrderShipmentAgent, PaymentAgent, PolicyAgent
 # ---------------------------------------------------------------------------
@@ -33,7 +32,8 @@ class EntityResult:
 class ShipmentResult:
     """Kết quả của OrderShipmentAgent sau khi tra cứu đơn hàng và vận chuyển."""
 
-    # on_time | seller_delay | logistics_delay | lost | returned | conflicting | insufficient_evidence
+    # on_time | seller_delay | logistics_delay | lost | returned | conflicting |
+    # insufficient_evidence
     verdict: str = "insufficient_evidence"
     # Danh sách seller_id bị delay (nếu có)
     late_seller_ids: list[str] = field(default_factory=list)
