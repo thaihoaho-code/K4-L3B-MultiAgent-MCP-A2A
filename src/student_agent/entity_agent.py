@@ -4,14 +4,6 @@ import unicodedata
 from difflib import SequenceMatcher
 from typing import Any
 
-from .evidence_utils import (
-    collect_identifiers,
-    evidence_data,
-    evidence_ref,
-    first_value,
-    is_negative_result,
-    unique_strings,
-)
 from .mcp_gateway import EvidenceGateway
 from .state import EntityResult
 from .trace import TraceWriter

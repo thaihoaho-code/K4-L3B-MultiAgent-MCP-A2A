@@ -96,17 +96,60 @@ def _check_entity(result: EntityResult) -> None:
         raise ValueError("unresolved entity cannot select an order")
 
 
-class _DeferredDecisionTrace:
-    """Defer a specialist's decision event until its result is accepted."""
+class _ManagedTrace:
+    """Suppress agent-owned coordination events; dispatch owns those events."""
 
-    def __init__(self, writer: TraceWriter, event_type: str) -> None:
+    def __init__(self, writer: TraceWriter, suppressed: set[str] | None = None) -> None:
         self._writer = writer
-        self._event_type = event_type
+        self._suppressed = suppressed or set()
 
     def emit(self, **kwargs: Any) -> dict[str, Any]:
-        if kwargs.get("event_type") == self._event_type:
+        if kwargs.get("event_type") in self._suppressed:
             return {}
         return self._writer.emit(**kwargs)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._writer, name)
+
+
+def _agent_trace(writer: TraceWriter, *event_types: str) -> _ManagedTrace:
+    return _ManagedTrace(writer, {"task_assigned", "handoff", *event_types})
+
+
+def _invoke_shipment(
+    agent: OrderShipmentInvestigator,
+    entity: EntityResult,
+    gateway: CaseGateway,
+    trace: _ManagedTrace,
+    case_id: str,
+) -> Any:
+    try:
+        return agent.investigate(entity, gateway, trace, case_id=case_id)
+    except TypeError as exc:
+        if "case_id" not in str(exc):
+            raise
+        return agent.investigate(entity, gateway, trace)
+
+
+def _invoke_payment(
+    agent: PaymentInvestigator,
+    entity: EntityResult,
+    gateway: CaseGateway,
+    trace: _ManagedTrace,
+    case: dict[str, Any],
+) -> Any:
+    try:
+        return agent.check_transactions(
+            entity,
+            gateway,
+            trace,
+            case_id=case["case_id"],
+            case=case,
+        )
+    except TypeError as exc:
+        if "case_id" not in str(exc) and "case" not in str(exc):
+            raise
+        return agent.check_transactions(entity, gateway, trace)
 
 
 def _check_output(output: dict[str, Any], state: CoordinatorState, trace: TraceWriter) -> None:
@@ -225,7 +268,11 @@ async def run_case(
     entity_task = state.next_task("resolve_entity")
     entity_reply = await dispatch(
         entity_task,
-        lambda: entity_agent.resolve(state.input_case, scoped_gateway, trace),
+        lambda: entity_agent.resolve(
+            state.input_case,
+            scoped_gateway,
+            _agent_trace(trace),
+        ),
         EntityResult,
         lambda value: {
             "resolved": "ok",
@@ -248,7 +295,13 @@ async def run_case(
         shipment_task = state.next_task("investigate_order_shipment", scope)
         shipment_reply = await dispatch(
             shipment_task,
-            lambda: order_shipment_agent.investigate(state.entity, scoped_gateway, trace, case_id=state.case_id),
+            lambda: _invoke_shipment(
+                order_shipment_agent,
+                state.entity,
+                scoped_gateway,
+                _agent_trace(trace),
+                state.case_id,
+            ),
             ShipmentResult,
             lambda value: (
                 "insufficient_evidence" if value.verdict == "insufficient_evidence" else "ok"
@@ -266,7 +319,13 @@ async def run_case(
         payment_task = state.next_task("investigate_payment_refund", scope)
         payment_reply = await dispatch(
             payment_task,
-            lambda: payment_agent.check_transactions(state.entity, scoped_gateway, trace),
+            lambda: _invoke_payment(
+                payment_agent,
+                state.entity,
+                scoped_gateway,
+                _agent_trace(trace),
+                state.input_case,
+            ),
             PaymentResult,
             lambda value: (
                 "insufficient_evidence" if value.verdict == "insufficient_evidence" else "ok"
@@ -290,7 +349,7 @@ async def run_case(
                 state.shipment,
                 state.payment,
                 scoped_gateway,
-                _DeferredDecisionTrace(trace, "policy_decided"),
+                _agent_trace(trace, "policy_decided"),
             ),
             PolicyResult,
             lambda value: (
@@ -335,7 +394,7 @@ async def run_case(
                 state.shipment,
                 state.payment,
                 state.policy,
-                _DeferredDecisionTrace(trace, "verification_completed"),
+                _agent_trace(trace, "verification_completed"),
             ),
             dict,
             lambda _value: "ok",

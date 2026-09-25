@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 from typing import Any
 
 from .state import (
@@ -11,21 +10,6 @@ from .state import (
     ShipmentResult,
 )
 from .trace import TraceWriter
-
-
-def _unique_ids(values: list[str], limit: int = 20) -> list[str]:
-    result: list[str] = []
-    for value in values:
-        text = str(value).strip()
-        if text and text not in result:
-            result.append(text)
-        if len(result) >= limit:
-            break
-    return result
-
-
-def _confidence(value: float) -> float:
-    return round(min(max(value, 0.0), 1.0), 4) if math.isfinite(value) else 0.0
 
 
 class VerifierAgent:
@@ -52,22 +36,13 @@ class VerifierAgent:
         """
         case_id = case["case_id"]
 
-        # Gom toàn bộ evidence refs từ các agent.
-        all_evidence_refs = sorted(
-            set(
-                entity.evidence_refs
-                + shipment.evidence_refs
-                + payment.evidence_refs
-                + policy.evidence_refs
-            )
-        )[:30]
-
-        order_ids = _unique_ids(shipment.order_ids)
-        if entity.resolution_status == "resolved" and entity.resolved_order_id:
-            if entity.resolved_order_id not in order_ids:
-                order_ids.insert(0, entity.resolved_order_id)
-            order_ids = order_ids[:20]
-        payment_references = _unique_ids(payment.payment_references)
+        # Gom toàn bộ evidence refs từ các agent
+        all_evidence_refs = sorted(set(
+            entity.evidence_refs
+            + shipment.evidence_refs
+            + payment.evidence_refs
+            + policy.evidence_refs
+        ))
 
         trace.emit(
             case_id=case_id,
@@ -93,17 +68,17 @@ class VerifierAgent:
 
             "assessment": {
                 "primary_issue": policy.primary_issue,
-                "secondary_issues": list(dict.fromkeys(policy.secondary_issues))[:10],
+                "secondary_issues": policy.secondary_issues,
                 "case_status": policy.case_status,
-                "confidence": _confidence(policy.confidence),
+                "confidence": round(policy.confidence, 4),
             },
 
             "affected_entities": {
-                "order_ids": order_ids,
-                "item_ids": _unique_ids(shipment.item_ids),
-                "seller_ids": _unique_ids(shipment.seller_ids),
-                "payment_references": payment_references,
-                "shipment_ids": _unique_ids(shipment.shipment_ids),
+                "order_ids": shipment.order_ids,
+                "item_ids": shipment.item_ids,
+                "seller_ids": shipment.seller_ids,
+                "payment_references": payment.payment_references,
+                "shipment_ids": shipment.shipment_ids,
             },
 
             "entity_resolution": {
@@ -111,13 +86,13 @@ class VerifierAgent:
                 "resolved_order_ids": (
                     [entity.resolved_order_id] if entity.resolved_order_id else []
                 ),
-                "rejected_candidates": _unique_ids(entity.rejected_order_ids),
-                "confidence": _confidence(entity.confidence),
+                "rejected_candidates": entity.rejected_order_ids,
+                "confidence": round(entity.confidence, 4),
             },
 
             "customer_context": {
                 "customer_unique_id": entity.customer_unique_id,
-                "related_order_ids": _unique_ids(entity.related_order_ids),
+                "related_order_ids": entity.related_order_ids,
             },
 
             "shipment_analysis": {

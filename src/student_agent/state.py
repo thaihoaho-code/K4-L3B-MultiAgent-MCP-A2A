@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any
 
 # ---------------------------------------------------------------------------
 # EntityAgent → OrderShipmentAgent, PaymentAgent, PolicyAgent
@@ -45,6 +46,14 @@ class ShipmentResult:
     # Timeline có đầy đủ không (ảnh hưởng confidence)
     timeline_complete: bool = False
     evidence_refs: list[str] = field(default_factory=list)
+    # Internal investigation details kept for direct agent diagnostics/tests.
+    # They are intentionally excluded from the public output formatter.
+    order_details: dict[str, Any] = field(default_factory=dict, repr=False)
+    products: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    shipments: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    evidence: list[dict[str, Any]] = field(default_factory=list, repr=False)
+    investigation_notes: list[str] = field(default_factory=list, repr=False)
+    damaged_shipment_ids: list[str] = field(default_factory=list, repr=False)
 
 
 # ---------------------------------------------------------------------------
