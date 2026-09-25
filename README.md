@@ -144,6 +144,23 @@ Trace chỉ ghi sự kiện quan sát được như `task_assigned`, `handoff`, 
 
 Hoàn thiện mô tả thiết kế trong `ARCHITECTURE.md`.
 
+### Bắt đầu Phase 2 trên scaffold chung
+
+Đọc [kiến trúc và interface](ARCHITECTURE.md) cùng [phân công chi tiết](LAB09_Task_Breakdown_MultiAgent_MCP_A2A.md). Sau khi branch `develop` có scaffold Phase 1, mỗi thành viên tạo feature branch từ `develop`:
+
+```bash
+git fetch origin
+git switch develop
+git pull --ff-only origin develop
+git switch -c feature/phat-entity-customer  # ví dụ cho Phát
+```
+
+Các file specialist ở `src/student_agent/agents/` đã có hàm stub với signature thống nhất `(AgentTask, EvidenceGateway, TraceWriter) -> AgentResult`. Phát sở hữu `entity_customer.py`; Phúc sở hữu `order_product.py` và `shipment.py`; Hoàng sở hữu `payment_refund.py`; Hồng sở hữu `policy.py` và `conflict_resolver.py`; Hòa sở hữu `verifier.py`. Sang sở hữu `workflow.py`, `a2a.py`, `agent_types.py` và tích hợp cuối. Không dùng các module agent cũ ở root `src/student_agent/` vì chúng đã được thay thế.
+
+Nếu đã tạo branch từ `main` trước scaffold, hãy fetch rồi rebase branch đó lên `origin/develop` trước khi thêm code Phase 2. Nếu branch đã có commit và được push, chỉ cập nhật remote bằng `git push --force-with-lease` sau khi đã kiểm tra lại lịch sử branch.
+
+Phase 1 chỉ khóa interface và trace giao việc. `day09 run` sẽ dừng có chủ đích cho tới khi specialist, output assembly và verifier của Phase 2 được triển khai. Trước PR, chạy `ruff check .` và `pytest -q`, ghi rõ field output và MCP tool thực tế đã dùng. Không đưa key, input case thật, output hay trace vào commit.
+
 ## 6. Chạy và kiểm tra
 
 ```bash
